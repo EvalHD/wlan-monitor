@@ -1,21 +1,310 @@
-name: Build APK
-on: [push, workflow_dispatch]
+name: Android APK bauen
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - run: unzip "wlan-monitor-projekt (1).zip" -d projekt
-      - uses: actions/setup-java@v4
+      - name: Repository herunterladen
+        uses: actions/checkout@v4
+
+      - name: Java 17 einrichten
+        uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: 17
-      - uses: gradle/actions/setup-gradle@v4
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Gradle einrichten
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Projekt entpacken und Mobilfunk-Code einbauen
+        run: |
+          unzip -o wlan-monitor-projekt.zip
+
+          MANIFEST_PATH=$(find . -name "AndroidManifest.xml" | head -n 1)
+          MAIN_PATH=$(find . -name "MainActivity.kt" | head -n 1)
+
+          cat << 'EOF' > "$MANIFEST_PATH"
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="de.wlanmonitor">
+
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="WLAN &amp; Mobilfunk Monitor"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > "$MAIN_PATH"
+          package de.wlanmonitor
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.wifi.WifiManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.telephony.*
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private lateinit var wifiText: TextView
+              private lateinit var mobileText: TextView
+              private val handler = Handler(Looper.getMainLooper())
+              private var isRunning = false
+
+              private val updateRunnable = object : Runnable {
+                  override fun run() {
+                      if (isRunning) {
+                          updateSignalValues()
+                          handler.postDelayed(this, 1500)
+                      }
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val scrollView = ScrollView(this).apply {
+                      setBackgroundColor(Color.parseColor("#121212"))
+                  }
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(50, 80, 50, 80)
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "Signal-Monitor (dBm)"
+                      textSize = 24f
+                      setTypeface(null, Typeface.BOLD)
+                      setTextColor(Color.WHITE)
+                      setPadding(0, 0, 0, 50)
+                  }
+
+                  wifiText = TextView(this).apply {
+                      textSize = 18f
+                      setTextColor(Color.parseColor("#80CBC4"))
+                      setBackgroundColor(Color.parseColor("#1E1E1E"))
+                      setPadding(40, 40, 40, 40)
+                      text = "WLAN wird geladen..."
+                  }
+
+                  val spacer = TextView(this).apply { height = 40 }
+
+                  mobileText = TextView(this).apply {
+                      textSize = 18f
+                      setTextColor(Color.parseColor("#90CAF9"))
+                      setBackgroundColor(Color.parseColor("#1E1E1E"))
+                      setPadding(40, 40, 40, 40)
+                      text = "Mobilfunk wird geladen..."
+                  }
+
+                  val spacer2 = TextView(this).apply { height = 50 }
+
+                  val btn = Button(this).apply {
+                      text = "Berechtigungen prüfen / Messung starten"
+                      setOnClickListener { checkPermissionsAndRun() }
+                  }
+
+                  root.addView(title)
+                  root.addView(wifiText)
+                  root.addView(spacer)
+                  root.addView(mobileText)
+                  root.addView(spacer2)
+                  root.addView(btn)
+                  scrollView.addView(root)
+                  setContentView(scrollView)
+
+                  checkPermissionsAndRun()
+              }
+
+              private fun checkPermissionsAndRun() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                      val perms = arrayOf(
+                          Manifest.permission.ACCESS_FINE_LOCATION,
+                          Manifest.permission.ACCESS_COARSE_LOCATION,
+                          Manifest.permission.READ_PHONE_STATE
+                      )
+                      val missing = perms.filter {
+                          checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+                      }
+                      if (missing.isNotEmpty()) {
+                          requestPermissions(missing.toTypedArray(), 101)
+                          return
+                      }
+                  }
+                  startLiveUpdate()
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  startLiveUpdate()
+              }
+
+              private fun startLiveUpdate() {
+                  isRunning = true
+                  handler.removeCallbacks(updateRunnable)
+                  handler.post(updateRunnable)
+              }
+
+              private fun getQualityText(dbm: Int, isWifi: Boolean): String {
+                  return if (isWifi) {
+                      when {
+                          dbm >= -55 -> "Sehr gut"
+                          dbm >= -67 -> "Gut"
+                          dbm >= -75 -> "Mittel"
+                          dbm >= -85 -> "Schwach"
+                          else -> "Sehr schwach"
+                      }
+                  } else {
+                      when {
+                          dbm >= -80 -> "Sehr gut"
+                          dbm >= -90 -> "Gut"
+                          dbm >= -100 -> "Mittel"
+                          dbm >= -110 -> "Schwach"
+                          else -> "Sehr schwach"
+                      }
+                  }
+              }
+
+              private fun updateSignalValues() {
+                  try {
+                      val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                      val info = wm.connectionInfo
+                      val rssi = info.rssi
+                      if (wm.isWifiEnabled && rssi != -127 && rssi != 0) {
+                          val speed = info.linkSpeed
+                          val quality = getQualityText(rssi, true)
+                          wifiText.text = "📶 WLAN\n\nPegel: $rssi dBm ($quality)\nSpeed: $speed Mbit/s"
+                      } else {
+                          wifiText.text = "📶 WLAN\n\nNicht mit einem WLAN verbunden"
+                      }
+                  } catch (e: Exception) {
+                      wifiText.text = "📶 WLAN\n\nFehler: ${e.message}"
+                  }
+
+                  try {
+                      val tm = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+                      var dbmValue: Int? = null
+                      var netType = "Unbekannt"
+
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          val strengths = tm.signalStrength?.cellSignalStrengths
+                          if (!strengths.isNullOrEmpty()) {
+                              for (s in strengths) {
+                                  if (s.dbm != Int.MAX_VALUE && s.dbm in -150..-30) {
+                                      dbmValue = s.dbm
+                                      netType = s.javaClass.simpleName
+                                          .replace("CellSignalStrength", "")
+                                          .uppercase()
+                                      if (netType == "NR") netType = "5G (NR)"
+                                      break
+                                  }
+                              }
+                          }
+                      }
+
+                      if (dbmValue == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                          checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                      ) {
+                          val cells = tm.allCellInfo
+                          if (!cells.isNullOrEmpty()) {
+                              for (cell in cells) {
+                                  if (cell.isRegistered) {
+                                      when (cell) {
+                                          is CellInfoLte -> {
+                                              dbmValue = cell.cellSignalStrength.dbm
+                                              netType = "4G (LTE)"
+                                          }
+                                          is CellInfoGsm -> {
+                                              dbmValue = cell.cellSignalStrength.dbm
+                                              netType = "2G (GSM)"
+                                          }
+                                          is CellInfoWcdma -> {
+                                              dbmValue = cell.cellSignalStrength.dbm
+                                              netType = "3G (WCDMA)"
+                                          }
+                                          else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && cell is CellInfoNr) {
+                                              dbmValue = cell.cellSignalStrength.dbm
+                                              netType = "5G (NR)"
+                                          }
+                                      }
+                                      if (dbmValue != null && dbmValue != Int.MAX_VALUE) break
+                                  }
+                              }
+                          }
+                      }
+
+                      if (dbmValue != null && dbmValue != Int.MAX_VALUE) {
+                          val quality = getQualityText(dbmValue, false)
+                          mobileText.text = "🗼 MOBILFUNK\n\nPegel: $dbmValue dBm ($quality)\nNetztyp: $netType"
+                      } else {
+                          mobileText.text = "🗼 MOBILFUNK\n\nKein Messwert verfügbar.\nBitte Standort (GPS) einschalten und Berechtigung zulassen."
+                      }
+                  } catch (e: SecurityException) {
+                      mobileText.text = "🗼 MOBILFUNK\n\nBerechtigung fehlt! Bitte auf den Button unten tippen."
+                  } catch (e: Exception) {
+                      mobileText.text = "🗼 MOBILFUNK\n\nFehler: ${e.message}"
+                  }
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  isRunning = false
+                  handler.removeCallbacks(updateRunnable)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (isRunning) startLiveUpdate()
+              }
+          }
+          EOF
+
+      - name: APK kompilieren
+        run: |
+          GRADLE_DIR=$(dirname $(find . -name "settings.gradle.kts" | head -n 1))
+          cd "$GRADLE_DIR"
+          gradle assembleDebug
+
+      - name: Fertige APK hochladen
+        uses: actions/upload-artifact@v4
         with:
-          gradle-version: 8.7
-      - run: gradle assembleDebug
-        working-directory: projekt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wlan-monitor-apk
-          path: projekt/app/build/outputs/apk/debug/app-debug.apk
+          name: wlan-mobilfunk-apk
+          path: "**/app-debug.apk"
