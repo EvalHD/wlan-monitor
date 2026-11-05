@@ -22,7 +22,7 @@ jobs:
       - name: Gradle einrichten
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Projekt entpacken und Mobilfunk-Code einbauen
+      - name: Projekt entpacken und WLAN + Mobilfunk + Ping + Jitter einbauen
         run: |
           unzip -o wlan-monitor-projekt.zip
 
@@ -34,6 +34,7 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
               package="de.wlanmonitor">
 
+              <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
               <uses-permission android:name="android.permission.READ_PHONE_STATE" />
@@ -76,18 +77,31 @@ jobs:
           import android.widget.LinearLayout
           import android.widget.ScrollView
           import android.widget.TextView
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.util.concurrent.Executors
+          import kotlin.math.abs
+          import kotlin.math.roundToInt
 
           class MainActivity : Activity() {
 
               private lateinit var wifiText: TextView
               private lateinit var mobileText: TextView
+              private lateinit var pingText: TextView
+
               private val handler = Handler(Looper.getMainLooper())
+              private val pingExecutor = Executors.newSingleThreadExecutor()
               private var isRunning = false
+
+              private val pingHistory = mutableListOf<Long>()
+              private var totalPings = 0
+              private var failedPings = 0
 
               private val updateRunnable = object : Runnable {
                   override fun run() {
                       if (isRunning) {
                           updateSignalValues()
+                          measurePingAndJitter()
                           handler.postDelayed(this, 1500)
                       }
                   }
@@ -102,47 +116,64 @@ jobs:
 
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
-                      setPadding(50, 80, 50, 80)
+                      setPadding(50, 70, 50, 70)
                   }
 
                   val title = TextView(this).apply {
-                      text = "Signal-Monitor (dBm)"
+                      text = "Netzwerk-Monitor"
                       textSize = 24f
                       setTypeface(null, Typeface.BOLD)
                       setTextColor(Color.WHITE)
-                      setPadding(0, 0, 0, 50)
+                      setPadding(0, 0, 0, 40)
                   }
 
                   wifiText = TextView(this).apply {
-                      textSize = 18f
+                      textSize = 17f
                       setTextColor(Color.parseColor("#80CBC4"))
                       setBackgroundColor(Color.parseColor("#1E1E1E"))
-                      setPadding(40, 40, 40, 40)
+                      setPadding(40, 35, 40, 35)
                       text = "WLAN wird geladen..."
                   }
 
-                  val spacer = TextView(this).apply { height = 40 }
+                  val spacer1 = TextView(this).apply { height = 30 }
 
                   mobileText = TextView(this).apply {
-                      textSize = 18f
+                      textSize = 17f
                       setTextColor(Color.parseColor("#90CAF9"))
                       setBackgroundColor(Color.parseColor("#1E1E1E"))
-                      setPadding(40, 40, 40, 40)
+                      setPadding(40, 35, 40, 35)
                       text = "Mobilfunk wird geladen..."
                   }
 
-                  val spacer2 = TextView(this).apply { height = 50 }
+                  val spacer2 = TextView(this).apply { height = 30 }
+
+                  pingText = TextView(this).apply {
+                      textSize = 17f
+                      setTextColor(Color.parseColor("#FFE082"))
+                      setBackgroundColor(Color.parseColor("#1E1E1E"))
+                      setPadding(40, 35, 40, 35)
+                      text = "⚡ PING & JITTER\n\nMessung läuft..."
+                  }
+
+                  val spacer3 = TextView(this).apply { height = 40 }
 
                   val btn = Button(this).apply {
-                      text = "Berechtigungen prüfen / Messung starten"
-                      setOnClickListener { checkPermissionsAndRun() }
+                      text = "Messung neu starten / Berechtigungen"
+                      setOnClickListener {
+                          pingHistory.clear()
+                          totalPings = 0
+                          failedPings = 0
+                          checkPermissionsAndRun()
+                      }
                   }
 
                   root.addView(title)
                   root.addView(wifiText)
-                  root.addView(spacer)
+                  root.addView(spacer1)
                   root.addView(mobileText)
                   root.addView(spacer2)
+                  root.addView(pingText)
+                  root.addView(spacer3)
                   root.addView(btn)
                   scrollView.addView(root)
                   setContentView(scrollView)
@@ -203,7 +234,67 @@ jobs:
                   }
               }
 
+              private fun measurePingAndJitter() {
+                  pingExecutor.execute {
+                      val startTime = System.nanoTime()
+                      var currentPing: Long = -1
+                      totalPings++
+
+                      try {
+                          Socket().use { socket ->
+                              socket.connect(InetSocketAddress("1.1.1.1", 53), 1200)
+                          }
+                          currentPing = (System.nanoTime() - startTime) / 1_000_000
+                      } catch (e: Exception) {
+                          failedPings++
+                      }
+
+                      if (currentPing >= 0) {
+                          pingHistory.add(currentPing)
+                          if (pingHistory.size > 20) {
+                              pingHistory.removeAt(0)
+                          }
+                      }
+
+                      val avgPing = if (pingHistory.isNotEmpty()) {
+                          pingHistory.average().roundToInt()
+                      } else 0
+
+                      val jitter = if (pingHistory.size >= 2) {
+                          var diffSum = 0L
+                          for (i in 1 until pingHistory.size) {
+                              diffSum += abs(pingHistory[i] - pingHistory[i - 1])
+                          }
+                          (diffSum.toDouble() / (pingHistory.size - 1)).roundToInt()
+                      } else 0
+
+                      val packetLoss = if (totalPings > 0) {
+                          ((failedPings.toDouble() / totalPings) * 100).roundToInt()
+                      } else 0
+
+                      handler.post {
+                          if (currentPing >= 0) {
+                              val jitterRating = when {
+                                  jitter <= 5 -> "Sehr stabil"
+                                  jitter <= 15 -> "Gut"
+                                  jitter <= 30 -> "Mittel"
+                                  else -> "Instabil"
+                              }
+                              pingText.text = "⚡ PING & JITTER\n\n" +
+                                  "Aktueller Ping: $currentPing ms (Ø $avgPing ms)\n" +
+                                  "Jitter: $jitter ms ($jitterRating)\n" +
+                                  "Paketverlust: $packetLoss %"
+                          } else {
+                              pingText.text = "⚡ PING & JITTER\n\n" +
+                                  "Zeitüberschreitung (Offline / Kein Internet)\n" +
+                                  "Paketverlust: $packetLoss %"
+                          }
+                      }
+                  }
+              }
+
               private fun updateSignalValues() {
+                  // 1. WLAN-Messung
                   try {
                       val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
                       val info = wm.connectionInfo
@@ -213,12 +304,13 @@ jobs:
                           val quality = getQualityText(rssi, true)
                           wifiText.text = "📶 WLAN\n\nPegel: $rssi dBm ($quality)\nSpeed: $speed Mbit/s"
                       } else {
-                          wifiText.text = "📶 WLAN\n\nNicht mit einem WLAN verbunden"
+                          wifiText.text = "📶 WLAN\n\nNicht verbunden"
                       }
                   } catch (e: Exception) {
                       wifiText.text = "📶 WLAN\n\nFehler: ${e.message}"
                   }
 
+                  // 2. Mobilfunk-Messung
                   try {
                       val tm = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
                       var dbmValue: Int? = null
@@ -275,10 +367,10 @@ jobs:
                           val quality = getQualityText(dbmValue, false)
                           mobileText.text = "🗼 MOBILFUNK\n\nPegel: $dbmValue dBm ($quality)\nNetztyp: $netType"
                       } else {
-                          mobileText.text = "🗼 MOBILFUNK\n\nKein Messwert verfügbar.\nBitte Standort (GPS) einschalten und Berechtigung zulassen."
+                          mobileText.text = "🗼 MOBILFUNK\n\nKein Messwert verfügbar.\nBitte GPS einschalten & Berechtigung zulassen."
                       }
                   } catch (e: SecurityException) {
-                      mobileText.text = "🗼 MOBILFUNK\n\nBerechtigung fehlt! Bitte auf den Button unten tippen."
+                      mobileText.text = "🗼 MOBILFUNK\n\nBerechtigung fehlt! Bitte unten auf den Button tippen."
                   } catch (e: Exception) {
                       mobileText.text = "🗼 MOBILFUNK\n\nFehler: ${e.message}"
                   }
